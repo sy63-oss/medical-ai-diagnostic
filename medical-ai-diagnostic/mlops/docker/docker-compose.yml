@@ -1,0 +1,251 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────
+#  Medical AI Diagnostic — Full MLOps Stack
+#  Services: API · MLflow · Prometheus · Grafana · Redis ·
+#            PostgreSQL · Jaeger (tracing) · Nginx
+# ─────────────────────────────────────────────────────────────
+
+x-common-env: &common-env
+  TZ: UTC
+  ENV: ${ENV:-staging}
+  MODEL_VERSION: ${MODEL_VERSION:-v2.1.0}
+
+networks:
+  backend:
+    driver: bridge
+    internal: true
+  frontend:
+    driver: bridge
+  monitoring:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  mlflow_artifacts:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+services:
+
+  # ── API (FastAPI) ─────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: mlops/docker/Dockerfile.api
+      target: production
+    image: medical-diagnostic-api:${MODEL_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      CONSENT_SECRET: ${CONSENT_SECRET}
+      AUDIT_SALT: ${AUDIT_SALT}
+      REDIS_HOST: redis
+      DATABASE_URL: postgresql://diag:${DB_PASSWORD}@postgres:5432/diagnostic
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://app.yourdomain.com}
+      OTEL_EXPORTER_JAEGER_ENDPOINT: http://jaeger:14268/api/traces
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - frontend
+      - backend
+      - monitoring
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8G
+        reservations:
+          cpus: "2"
+          memory: 4G
+    volumes:
+      - ./configs:/app/configs:ro
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+    tmpfs:
+      - /tmp:noexec,nosuid,size=512m
+
+  # ── Model Training Worker ─────────────────────────────────
+  trainer:
+    build:
+      context: .
+      dockerfile: mlops/docker/Dockerfile.trainer
+    image: medical-diagnostic-trainer:${MODEL_VERSION:-latest}
+    environment:
+      <<: *common-env
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      DATA_PATH: /data
+      MODEL_OUTPUT: /artifacts
+    volumes:
+      - ./data:/data:ro
+      - mlflow_artifacts:/artifacts
+    networks:
+      - backend
+    profiles:
+      - training  # Only started for training runs: docker compose --profile training up trainer
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ── MLflow Tracking Server ────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.10.0
+    restart: unless-stopped
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql://mlflow:${MLFLOW_DB_PASSWORD}@postgres:5432/mlflow
+      --default-artifact-root /mlflow-artifacts
+      --serve-artifacts
+    environment:
+      <<: *common-env
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_artifacts:/mlflow-artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+      - frontend
+
+  # ── PostgreSQL ────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: diag
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: diagnostic
+      POSTGRES_MULTIPLE_DATABASES: diagnostic,mlflow,audit
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./mlops/docker/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U diag -d diagnostic"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # ── Redis (sessions, rate limiting, cache) ────────────────
+  redis:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+      --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Prometheus ────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.50.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-lifecycle
+    volumes:
+      - ./mlops/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./mlops/monitoring/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - monitoring
+
+  # ── Grafana ───────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.3.1
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_SERVER_ROOT_URL: https://monitoring.yourdomain.com
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_CONTENT_SECURITY_POLICY: "true"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./mlops/monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./mlops/monitoring/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - monitoring
+      - frontend
+
+  # ── Jaeger (distributed tracing) ─────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    restart: unless-stopped
+    environment:
+      COLLECTOR_ZIPKIN_HOST_PORT: ":9411"
+      SPAN_STORAGE_TYPE: badger
+      BADGER_EPHEMERAL: "false"
+      BADGER_DIRECTORY_VALUE: /badger/data
+      BADGER_DIRECTORY_KEY: /badger/key
+    ports:
+      - "16686:16686"  # UI
+      - "14268:14268"  # HTTP collector
+    networks:
+      - monitoring
+      - backend
+
+  # ── Nginx Reverse Proxy ───────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./mlops/docker/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./mlops/docker/certs:/etc/nginx/certs:ro
+    depends_on:
+      - api
+    networks:
+      - frontend
+    security_opt:
+      - no-new-privileges:true

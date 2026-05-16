@@ -1,0 +1,36 @@
+# ── Secrets (NEVER commit) ────────────────────────────────────
+.env
+*.pem
+*.key
+kubeconfig.yaml
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Data (managed by DVC) ─────────────────────────────────────
+data/
+!data/.gitkeep
+
+# ── MLflow artifacts (large binaries) ─────────────────────────
+mlops/mlflow/
+*.h5
+*.pb
+saved_model/
+
+# ── Test & coverage outputs ───────────────────────────────────
+.coverage
+coverage.xml
+test-results.xml
+htmlcov/
+.pytest_cache/
+
+# ── IDE ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store

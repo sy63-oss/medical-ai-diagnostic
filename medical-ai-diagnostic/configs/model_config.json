@@ -1,0 +1,15 @@
+{
+  "bert_model_name": "emilyalsentzer/Bio_ClinicalBERT",
+  "max_sequence_length": 256,
+  "num_symptom_classes": 500,
+  "num_diagnostic_categories": 150,
+  "dropout_rate": 0.3,
+  "learning_rate": 2e-5,
+  "batch_size": 32,
+  "epochs": 20,
+  "early_stopping_patience": 5,
+  "severity_levels": 4,
+  "confidence_threshold": 0.7,
+  "warmup_steps": 1000,
+  "decay_steps": 10000
+}

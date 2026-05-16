@@ -1,0 +1,36 @@
+# Production runtime dependencies for the FastAPI API server.
+# Excludes ML training packages (TensorFlow training, MLflow, DVC)
+# that are not needed at inference time.
+
+# ── API Framework ─────────────────────────────────────────────
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+gunicorn==21.2.0
+pydantic==2.6.1
+
+# ── Auth & Security ───────────────────────────────────────────
+PyJWT==2.8.0
+cryptography==42.0.2
+python-multipart==0.0.9
+passlib[bcrypt]==1.7.4
+
+# ── Inference Runtime ─────────────────────────────────────────
+tensorflow==2.19.1
+transformers==4.51.3
+sentencepiece==0.1.99
+numpy==1.26.3
+
+# ── Cache & Storage ───────────────────────────────────────────
+redis==5.0.1
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.25
+
+# ── Monitoring & Observability ────────────────────────────────
+prometheus-client==0.20.0
+opentelemetry-sdk==1.22.0
+opentelemetry-instrumentation-fastapi==0.43b0
+opentelemetry-exporter-jaeger==1.21.0
+
+# ── Utilities ─────────────────────────────────────────────────
+python-dotenv==1.0.1
+httpx==0.26.0

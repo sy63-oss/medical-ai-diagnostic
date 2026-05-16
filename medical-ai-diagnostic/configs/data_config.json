@@ -1,0 +1,29 @@
+{
+  "sources": {
+    "mimic3": {
+      "type": "s3",
+      "bucket": "your-secure-hipaa-bucket",
+      "prefix": "mimic3/de-identified/",
+      "encryption": "SSE-KMS",
+      "enabled_in_dev": false
+    },
+    "eicu": {
+      "type": "s3",
+      "bucket": "your-secure-hipaa-bucket",
+      "prefix": "eicu-crd/de-identified/",
+      "encryption": "SSE-KMS",
+      "enabled_in_dev": false
+    },
+    "synthetic": {
+      "type": "local",
+      "enabled_in_dev": true,
+      "n_records": 850000,
+      "random_seed": 42
+    }
+  },
+  "output_format": "parquet",
+  "compression": "snappy",
+  "target_records": 850000,
+  "de_identification_method": "HIPAA_safe_harbor",
+  "icd10_version": "ICD-10-CM-2024"
+}

@@ -1,0 +1,350 @@
+# ─────────────────────────────────────────────────────────────
+#  Medical AI Diagnostic — Kubernetes Production Manifests
+#  Includes: Deployment · HPA · PodDisruptionBudget · 
+#            NetworkPolicy · Service · Ingress
+# ─────────────────────────────────────────────────────────────
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: medical-diagnostic-api
+  namespace: medical-ai
+  labels:
+    app: medical-diagnostic
+    component: api
+    version: "v2.1.0"
+    compliance: hipaa
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+    description: "HIPAA-compliant medical diagnostic API"
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0       # Zero-downtime deployment
+  selector:
+    matchLabels:
+      app: medical-diagnostic
+      component: api
+  template:
+    metadata:
+      labels:
+        app: medical-diagnostic
+        component: api
+        version: "v2.1.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: medical-diagnostic-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      
+      # Graceful shutdown: drain connections before termination
+      terminationGracePeriodSeconds: 60
+
+      # Spread across nodes for HA
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: medical-diagnostic
+
+      # Init container: wait for dependencies
+      initContainers:
+        - name: wait-for-redis
+          image: redis:7.2-alpine
+          command: ['sh', '-c', 'until redis-cli -h redis-service ping; do echo "Waiting for Redis..."; sleep 2; done']
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+
+      containers:
+        - name: api
+          image: your-registry/medical-diagnostic-api:v2.1.0
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          
+          env:
+            - name: ENV
+              value: "production"
+            - name: REDIS_HOST
+              value: "redis-service"
+            - name: MLFLOW_TRACKING_URI
+              value: "http://mlflow-service:5000"
+            # Secrets from Vault or K8s Secrets
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: medical-diagnostic-secrets
+                  key: jwt-secret-key
+            - name: CONSENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: medical-diagnostic-secrets
+                  key: consent-secret
+            - name: AUDIT_SALT
+              valueFrom:
+                secretKeyRef:
+                  name: medical-diagnostic-secrets
+                  key: audit-salt
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: medical-diagnostic-secrets
+                  key: database-url
+
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "4Gi"
+            limits:
+              cpu: "4000m"
+              memory: "8Gi"
+
+          # Liveness: restart if stuck
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          # Readiness: remove from LB if not ready
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # Startup: allow extra time for model loading
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: 30
+            periodSeconds: 10
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+
+          volumeMounts:
+            - name: configs
+              mountPath: /app/configs
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: configs
+          configMap:
+            name: medical-diagnostic-config
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
+
+      # Only pull from trusted registry
+      imagePullSecrets:
+        - name: registry-credentials
+
+---
+# ── Horizontal Pod Autoscaler ─────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: medical-diagnostic-hpa
+  namespace: medical-ai
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: medical-diagnostic-api
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+    - type: Pods
+      pods:
+        metric:
+          name: diagnostic_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "50"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300    # Slow scale-down (5 min)
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
+---
+# ── Pod Disruption Budget ─────────────────────────────────────
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: medical-diagnostic-pdb
+  namespace: medical-ai
+spec:
+  minAvailable: 2    # Always keep at least 2 pods up
+  selector:
+    matchLabels:
+      app: medical-diagnostic
+      component: api
+
+---
+# ── Network Policy ────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: medical-diagnostic-netpol
+  namespace: medical-ai
+spec:
+  podSelector:
+    matchLabels:
+      app: medical-diagnostic
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow from ingress controller only
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - port: 8000
+    # Allow Prometheus scraping
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+      ports:
+        - port: 8000
+  egress:
+    # Allow to Redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - port: 6379
+    # Allow to PostgreSQL
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - port: 5432
+    # Allow to MLflow
+    - to:
+        - podSelector:
+            matchLabels:
+              app: mlflow
+      ports:
+        - port: 5000
+    # Allow DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP
+
+---
+# ── Service ───────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: medical-diagnostic-service
+  namespace: medical-ai
+  labels:
+    app: medical-diagnostic
+spec:
+  selector:
+    app: medical-diagnostic
+    component: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+  type: ClusterIP
+
+---
+# ── Ingress with TLS ──────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: medical-diagnostic-ingress
+  namespace: medical-ai
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/enable-cors: "false"   # Handled by FastAPI
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.medical-diagnostic.yourdomain.com
+      secretName: medical-diagnostic-tls
+  rules:
+    - host: api.medical-diagnostic.yourdomain.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: medical-diagnostic-service
+                port:
+                  number: 80
+          - path: /health
+            pathType: Exact
+            backend:
+              service:
+                name: medical-diagnostic-service
+                port:
+                  number: 80

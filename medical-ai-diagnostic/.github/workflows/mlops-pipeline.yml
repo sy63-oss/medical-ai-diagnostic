@@ -1,0 +1,328 @@
+name: Medical AI Diagnostic — CI/CD MLOps Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'mlops/**'
+      - 'tests/**'
+      - 'requirements*.txt'
+  pull_request:
+    branches: [main]
+  schedule:
+    # Nightly model drift check
+    - cron: '0 2 * * *'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/medical-diagnostic-api
+  PYTHON_VERSION: "3.11"
+  TF_CPP_MIN_LOG_LEVEL: "3"
+
+jobs:
+
+  # ── 1. Code Quality & Security ───────────────────────────────
+  quality:
+    name: Code Quality & Security Scan
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install linting tools
+        run: pip install ruff mypy bandit safety pylint
+
+      - name: Ruff linting
+        run: ruff check src/ tests/ mlops/
+
+      - name: Type checking (mypy)
+        run: mypy src/ --ignore-missing-imports
+
+      - name: Security scan (Bandit)
+        run: bandit -r src/ -ll -x tests/
+        # -ll = medium severity and above only
+
+      - name: Dependency vulnerability scan
+        run: safety check --full-report
+
+      - name: PHI leakage detection
+        run: |
+          # Custom check: ensure no real patient data patterns in code
+          python scripts/check_phi_patterns.py src/ tests/
+
+  # ── 2. Unit & Integration Tests ──────────────────────────────
+  test:
+    name: Tests
+    runs-on: ubuntu-22.04
+    needs: quality
+    services:
+      redis:
+        image: redis:7.2-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests with coverage
+        env:
+          JWT_SECRET_KEY: test-secret-key-not-production
+          CONSENT_SECRET: test-consent-secret
+          AUDIT_SALT: test-audit-salt
+          REDIS_HOST: localhost
+        run: |
+          pytest tests/ \
+            --cov=src \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --cov-fail-under=85 \
+            --junit-xml=test-results.xml \
+            -v \
+            --timeout=120
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+          fail_ci_if_error: true
+
+      - name: Publish test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: test-results.xml
+
+  # ── 3. Data Pipeline Tests (DVC) ─────────────────────────────
+  data-pipeline:
+    name: DVC Data Pipeline
+    runs-on: ubuntu-22.04
+    needs: quality
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup DVC
+        run: pip install dvc[s3]==3.42.0
+
+      - name: Pull DVC cache
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.DVC_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.DVC_AWS_SECRET_ACCESS_KEY }}
+        run: dvc pull --run-cache
+
+      - name: Run DVC pipeline (dry run)
+        run: dvc repro --dry
+
+      - name: Data validation
+        run: python -m mlops.training_pipeline --validate-only
+
+  # ── 4. Model Training (triggered manually or nightly) ────────
+  train:
+    name: Train & Register Model
+    runs-on: [self-hosted, gpu, linux]    # Requires GPU runner
+    needs: [test, data-pipeline]
+    if: |
+      github.event_name == 'schedule' ||
+      (github.event_name == 'push' && contains(github.event.head_commit.message, '[train]'))
+    environment: ml-training
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run MLflow training pipeline
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_TOKEN: ${{ secrets.MLFLOW_TRACKING_TOKEN }}
+        run: |
+          python -m mlops.training_pipeline \
+            --epochs 20 \
+            --batch-size 32 \
+            --run-name "ci-run-${{ github.run_number }}"
+
+      - name: Check model performance gates
+        run: python scripts/check_model_gates.py
+        # Fails if performance metrics don't meet thresholds
+
+  # ── 5. Build & Push Docker Image ─────────────────────────────
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-22.04
+    needs: test
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: mlops/docker/Dockerfile.api
+          target: production
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Container vulnerability scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'    # Fail on HIGH/CRITICAL CVEs
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ── 6. Deploy to Staging ─────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-22.04
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://staging-api.medical-diagnostic.yourdomain.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to Kubernetes (Staging)
+        env:
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_STAGING }}
+        run: |
+          echo "$KUBECONFIG_DATA" | base64 -d > kubeconfig.yaml
+          export KUBECONFIG=./kubeconfig.yaml
+          # Update image tag
+          kubectl set image deployment/medical-diagnostic-api \
+            api=${{ needs.build.outputs.image-tag }} \
+            -n medical-ai-staging
+          kubectl rollout status deployment/medical-diagnostic-api \
+            -n medical-ai-staging --timeout=300s
+
+      - name: Run smoke tests
+        run: |
+          sleep 30
+          python tests/smoke/test_staging.py \
+            --base-url https://staging-api.medical-diagnostic.yourdomain.com
+
+  # ── 7. Deploy to Production ───────────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-22.04
+    needs: [build, deploy-staging]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://api.medical-diagnostic.yourdomain.com
+    # Requires manual approval via GitHub Environments
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to Kubernetes (Production)
+        env:
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_PRODUCTION }}
+        run: |
+          echo "$KUBECONFIG_DATA" | base64 -d > kubeconfig.yaml
+          export KUBECONFIG=./kubeconfig.yaml
+          kubectl set image deployment/medical-diagnostic-api \
+            api=${{ needs.build.outputs.image-tag }} \
+            -n medical-ai
+          kubectl rollout status deployment/medical-diagnostic-api \
+            -n medical-ai --timeout=300s
+
+      - name: Post-deployment health check
+        run: python tests/smoke/test_production.py
+
+      - name: Notify on success
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "✅ Medical AI API v${{ github.sha }} deployed to Production",
+              "channel": "#ml-deployments"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  # ── 8. Model Drift Monitoring (nightly) ──────────────────────
+  drift-check:
+    name: Model Drift Check
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install monitoring tools
+        run: pip install evidently alibi-detect
+
+      - name: Run drift detection
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          METRICS_ENDPOINT: ${{ secrets.METRICS_ENDPOINT }}
+        run: python scripts/drift_detection.py --alert-threshold 0.05
+
+      - name: Alert on drift
+        if: failure()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: '{"text": "⚠️ Model drift detected — retraining may be needed", "channel": "#ml-alerts"}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}

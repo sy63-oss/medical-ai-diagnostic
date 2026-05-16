@@ -1,0 +1,90 @@
+# ─────────────────────────────────────────────────────────────
+#  Medical AI Diagnostic API — Dockerfile
+#  Multi-stage build: builder → production
+#  Security: non-root user, minimal surface, no shell in prod
+# ─────────────────────────────────────────────────────────────
+
+# ── Stage 1: Dependency builder ───────────────────────────────
+FROM python:3.11-slim-bookworm AS builder
+
+WORKDIR /build
+
+# Install build tools (not needed in production)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ libpq-dev curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy only requirements first (layer caching)
+COPY requirements.txt requirements-prod.txt ./
+
+# Install into an isolated prefix
+RUN pip install --upgrade pip && \
+    pip install --prefix=/install --no-cache-dir -r requirements-prod.txt
+
+# ── Stage 2: Production image ────────────────────────────────
+FROM python:3.11-slim-bookworm AS production
+
+LABEL maintainer="ml-engineering@yourdomain.com"
+LABEL version="2.1.0"
+LABEL description="Medical AI Diagnostic API - HIPAA Compliant"
+
+# Security: non-root user
+RUN groupadd --gid 1001 appgroup && \
+    useradd --uid 1001 --gid appgroup --no-create-home --shell /bin/false appuser
+
+WORKDIR /app
+
+# Runtime dependencies only
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Copy installed packages from builder
+COPY --from=builder /install /usr/local
+
+# Copy application code
+COPY --chown=appuser:appgroup src/ ./src/
+COPY --chown=appuser:appgroup configs/ ./configs/
+
+# Set secure permissions
+RUN chmod -R 550 /app/src && \
+    chmod -R 440 /app/configs
+
+# Switch to non-root
+USER appuser
+
+# Environment
+ENV PYTHONPATH=/app \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PORT=8000
+
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Start with Gunicorn + Uvicorn workers
+CMD ["gunicorn", \
+     "src.api.main:app", \
+     "--worker-class", "uvicorn.workers.UvicornWorker", \
+     "--workers", "4", \
+     "--bind", "0.0.0.0:8000", \
+     "--timeout", "120", \
+     "--keepalive", "5", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-", \
+     "--log-level", "info", \
+     "--forwarded-allow-ips", "*"]
+
+# ── Stage 3: Development (with hot reload) ────────────────────
+FROM production AS development
+
+USER root
+RUN pip install watchfiles pytest pytest-asyncio httpx
+
+USER appuser
+
+CMD ["uvicorn", "src.api.main:app", "--reload", "--host", "0.0.0.0", "--port", "8000"]

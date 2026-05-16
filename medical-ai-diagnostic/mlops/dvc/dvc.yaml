@@ -1,0 +1,102 @@
+# dvc.yaml — Data Version Control Pipeline
+# Run with: dvc repro
+# Each stage is cached: only re-runs if inputs change
+
+stages:
+
+  ingest:
+    cmd: python -m src.preprocessing.ingest --output data/raw
+    deps:
+      - src/preprocessing/ingest.py
+      - configs/data_config.json
+    outs:
+      - data/raw/symptoms.parquet
+      - data/raw/diagnoses.parquet
+      - data/raw/icd10_mappings.json
+    metrics:
+      - data/raw/ingestion_stats.json:
+          cache: false
+
+  validate_raw:
+    cmd: python -m src.preprocessing.validate --input data/raw --report data/raw/validation_report.json
+    deps:
+      - src/preprocessing/validate.py
+      - data/raw/symptoms.parquet
+      - data/raw/diagnoses.parquet
+    outs:
+      - data/raw/validation_report.json:
+          cache: false
+
+  preprocess:
+    cmd: >
+      python -m src.preprocessing.pipeline
+      --input data/raw
+      --output data/processed
+      --config configs/preprocessing_config.json
+    deps:
+      - src/preprocessing/pipeline.py
+      - data/raw/symptoms.parquet
+      - data/raw/diagnoses.parquet
+      - configs/preprocessing_config.json
+    outs:
+      - data/processed/train.tfrecord
+      - data/processed/val.tfrecord
+      - data/processed/test.tfrecord
+      - data/processed/vocab.json
+      - data/processed/label_encoder.pkl
+    metrics:
+      - data/processed/preprocessing_stats.json:
+          cache: false
+
+  train:
+    cmd: >
+      python -m mlops.training_pipeline
+      --epochs ${epochs}
+      --batch-size ${batch_size}
+      --run-name dvc-run
+    deps:
+      - mlops/training_pipeline.py
+      - src/models/symptom_classifier.py
+      - data/processed/train.tfrecord
+      - data/processed/val.tfrecord
+      - configs/model_config.json
+    outs:
+      - mlops/mlflow/artifacts/best_model:
+          cache: true
+          persist: true
+    metrics:
+      - mlops/mlflow/artifacts/training_metrics.json:
+          cache: false
+    params:
+      - configs/model_config.json:
+          - learning_rate
+          - batch_size
+          - epochs
+          - dropout_rate
+          - bert_model_name
+
+  evaluate:
+    cmd: >
+      python -m src.evaluation.evaluate
+      --model mlops/mlflow/artifacts/best_model
+      --test-data data/processed/test.tfrecord
+      --output mlops/mlflow/artifacts/evaluation
+    deps:
+      - src/evaluation/evaluate.py
+      - mlops/mlflow/artifacts/best_model
+      - data/processed/test.tfrecord
+    metrics:
+      - mlops/mlflow/artifacts/evaluation/metrics.json:
+          cache: false
+    plots:
+      - mlops/mlflow/artifacts/evaluation/confusion_matrix.json:
+          x: predicted
+          y: actual
+          title: Diagnostic Confusion Matrix
+      - mlops/mlflow/artifacts/evaluation/roc_curve.json:
+          x: fpr
+          y: tpr
+          title: ROC Curve - Urgency Detection
+
+params:
+  - configs/model_config.json

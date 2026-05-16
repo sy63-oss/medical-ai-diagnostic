@@ -1,0 +1,66 @@
+# alert_rules.yml — Medical AI Diagnostic Alerts
+groups:
+  - name: medical_ai_critical
+    rules:
+      # ── Safety: Red flag detection failures ─────────────────
+      - alert: RedFlagDetectionDown
+        expr: rate(red_flag_alerts_total[5m]) == 0 and rate(diagnostic_requests_total{status="success"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+          team: ml-safety
+        annotations:
+          summary: "Red flag detection may be non-functional"
+          description: "Successful requests are occurring but zero red flags detected in 5 min window — possible model failure."
+
+      # ── Model confidence degradation ────────────────────────
+      - alert: LowModelConfidence
+        expr: histogram_quantile(0.50, diagnostic_confidence_bucket) < 0.60
+        for: 10m
+        labels:
+          severity: warning
+          team: ml-engineering
+        annotations:
+          summary: "Median model confidence below 60%"
+          description: "Potential model drift or data distribution shift detected."
+
+      # ── API latency SLO ─────────────────────────────────────
+      - alert: HighInferenceLatency
+        expr: histogram_quantile(0.95, model_inference_seconds_bucket) > 3.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P95 inference latency > 3s"
+          description: "95th percentile inference time has exceeded 3 seconds."
+
+      # ── High error rate ─────────────────────────────────────
+      - alert: HighErrorRate
+        expr: rate(diagnostic_requests_total{status="error"}[5m]) / rate(diagnostic_requests_total[5m]) > 0.05
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Error rate > 5%"
+          description: "More than 5% of requests are failing."
+
+      # ── Rate limit abuse ────────────────────────────────────
+      - alert: AbnormalRateLimiting
+        expr: rate(diagnostic_requests_total{status="rate_limited"}[1m]) > 50
+        for: 1m
+        labels:
+          severity: warning
+          team: security
+        annotations:
+          summary: "Abnormally high rate limiting — possible abuse"
+
+      # ── Service down ─────────────────────────────────────────
+      - alert: APIServiceDown
+        expr: up{job="medical-diagnostic-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          pagerduty: "true"
+        annotations:
+          summary: "Medical Diagnostic API is DOWN"
+          description: "Service has been unreachable for >1 minute. Immediate action required."

@@ -1,0 +1,20 @@
+{
+  "max_vocab_size": 12000,
+  "max_sequence_length": 256,
+  "train_split": 0.70,
+  "val_split": 0.15,
+  "test_split": 0.15,
+  "random_seed": 42,
+  "augmentation": {
+    "enabled": true,
+    "synonym_replacement_prob": 0.10,
+    "symptom_dropout_prob": 0.05
+  },
+  "anonymization": {
+    "method": "HIPAA_safe_harbor",
+    "strip_patterns": ["SSN", "phone", "email", "DOB", "name", "address", "MRN"]
+  },
+  "output_format": "tfrecord",
+  "temporal_max_steps": 30,
+  "metadata_dim": 20
+}

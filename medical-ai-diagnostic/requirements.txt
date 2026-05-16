@@ -1,0 +1,47 @@
+# Medical AI Diagnostic — Production Requirements
+# Pin all versions for reproducibility (HIPAA compliance requirement)
+
+# ── Deep Learning ─────────────────────────────────────────────
+tensorflow==2.19.1
+keras==3.8.0
+transformers==4.51.3
+sentencepiece==0.1.99
+torch==2.2.0                # For HuggingFace tokenizers
+
+# ── MLOps ─────────────────────────────────────────────────────
+mlflow==2.10.0
+dvc==3.42.0
+dvc[s3]==3.42.0
+evidently==0.4.16           # Model/data drift detection
+alibi-detect==0.12.0        # Outlier & drift detection
+
+# ── API ───────────────────────────────────────────────────────
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+gunicorn==21.2.0
+pydantic==2.6.1
+python-jose[cryptography]==3.3.0
+PyJWT==2.8.0
+
+# ── Data & Storage ────────────────────────────────────────────
+numpy==1.26.3
+pandas==2.2.0
+scikit-learn==1.4.0
+redis==5.0.1
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.25
+
+# ── Monitoring & Observability ────────────────────────────────
+prometheus-client==0.20.0
+opentelemetry-sdk==1.22.0
+opentelemetry-instrumentation-fastapi==0.43b0
+opentelemetry-exporter-jaeger==1.21.0
+
+# ── Security ──────────────────────────────────────────────────
+cryptography==42.0.2
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.9
+
+# ── Utilities ─────────────────────────────────────────────────
+python-dotenv==1.0.1
+httpx==0.26.0               # Async HTTP for health checks
