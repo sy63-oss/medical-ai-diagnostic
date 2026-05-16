@@ -4,16 +4,14 @@ TensorFlow + NLP with BERT-based embeddings
 HIPAA/GDPR-compliant design
 """
 
-import os
-import json
 import logging
-from typing import List, Dict, Optional, Tuple
+from typing import List
 from dataclasses import dataclass
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, Model, callbacks
-from transformers import AutoTokenizer, TFAutoModel
+from transformers import TFAutoModel
 import mlflow
 import mlflow.tensorflow
 
