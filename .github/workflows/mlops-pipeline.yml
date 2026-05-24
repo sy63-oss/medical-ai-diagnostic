@@ -10,9 +10,7 @@ on:
       - 'requirements*.txt'
   pull_request:
     branches: [main]
-  schedule:
-    # Nightly model drift check
-    - cron: '0 2 * * *'
+  
 
 env:
   REGISTRY: ghcr.io
